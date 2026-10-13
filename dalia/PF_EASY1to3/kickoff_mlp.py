@@ -36,7 +36,7 @@ if PACK is None:
 # An old or partial download stops here, not three cells later with a KeyError:
 # every file and column listed in the schema must be in the pack.
 with open(
-    os.path.join("PATH_DATA", "ontologies", "pack_schema.json"), encoding="utf-8"
+    os.path.join(PATH_DATA, "ontologies", "pack_schema.json"), encoding="utf-8"
 ) as fh:
     SCHEMA = json.load(fh)
 for name, spec in SCHEMA["files"].items():
@@ -51,7 +51,7 @@ for name, spec in SCHEMA["files"].items():
             raise SystemExit(
                 f"{name} lacks {sorted(absent)}: {PACK} is not the current pack"
             )
-if PACK == os.path.join("PATH_DATA", "sample"):
+if PACK == os.path.join(PATH_DATA, "sample"):
     print(
         "using the 10 % SAMPLE in data/sample/ -- every number below will differ from "
         "the full pack's; download the full pack before training anything (data/README.md)"
