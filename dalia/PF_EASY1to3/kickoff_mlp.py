@@ -448,6 +448,8 @@ def fit_mlp(
         "history": history,
     }  # <-- ajout
 
+def physical_targets(frame, targets):
+    return np.column_stack([physical_to_normalised(t, frame[t]) for t in targets])
 
 def predict_mlp(fit, X):
     X = torch.tensor(
