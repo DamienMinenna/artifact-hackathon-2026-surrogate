@@ -1,17 +1,13 @@
-# Setup
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import KFold, train_test_split
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
-
-import time
+import torch
+import torch.nn as nn
 
 from pallas_score import (
     normalised_to_physical,
@@ -19,11 +15,15 @@ from pallas_score import (
     score_submission,
 )
 
-time.sleep(1)
-print("hello")
-time.sleep(1)
+# 1. Hardware setup
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.set_num_threads(4)  # Prevent PyTorch OpenMP from hogging all 36 CPU cores
+print(
+    f"Using device: {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})"
+)
 
 PACK = "/workspace/data/surrogate-models/data/pallas_hackathon_data"
+
 
 TARGETS = [
     "mean_zeta_um",
@@ -32,15 +32,16 @@ TARGETS = [
     "mean_ux",
     "mean_uy",
     "mean_uz",
-]  # "sigma_zeta", "sigma_y", "sigma_z", "sigma_ux", "sigma_uy", "sigma_uz", 'q_tot_pC']
+]
 FEATURES = ["P_max", "cN2_max", "L_inj", "dip_frac", "x_of", "plane_mm"]
 KEY = ["row_id"]
 
+# 2. Data loading & cleaning
 data = pd.read_parquet(f"{PACK}/campaign_B_moments.parquet")
-data = data[(data.group == "all") & (data.q_tot_pC > 0)]
+data = data[(data.group == "all") & (data.q_tot_pC > 0)].reset_index(drop=True)
 data["row_id"] = np.arange(len(data))
 test_inputs = pd.read_parquet(f"{PACK}/test_moments_planes.parquet")
-ids = data.row_id.to_numpy()
+n_rows = len(data)
 
 
 def features(frame):
@@ -63,106 +64,110 @@ def score(pred, frame, zone=None):
     return score_submission(pred, frame[KEY + TARGETS], zone=zone)
 
 
-def rows_of(rows):
-    return data[data.row_id.isin(rows)]
+# Train / test split using direct indexing
+train_idx, test_idx = train_test_split(np.arange(n_rows), test_size=0.2, random_state=0)
+train, test = data.iloc[train_idx], data.iloc[test_idx]
+
+print(f"{len(data):,} total rows, {len(train):,} train / {len(test):,} test")
 
 
-train_id, test_id = train_test_split(ids, test_size=0.2, random_state=0)
-train, test = rows_of(train_id), rows_of(test_id)
-
-
-time.sleep(1)
-print(f"{len(data):,} rows with a bunch, {len(train):,} train / {len(test):,} test")
-time.sleep(1)
-
-# Linear baseline
-
+# 3. Linear baseline
 lin = make_pipeline(StandardScaler(), LinearRegression()).fit(
     features(train), targets(train)
 )
-time.sleep(1)
+print("Linear Regression score:")
 print(score(lin.predict(features(test)), test))
-time.sleep(1)
 
-# Random forest
-
-rf = RandomForestRegressor(n_estimators=100, n_jobs=-1, random_state=0).fit(
-    features(train), targets(train)
-)
+# 4. Random Forest baseline
+rf = RandomForestRegressor(
+    n_estimators=100,
+    n_jobs=16,  # Cap worker threads to prevent full CPU thrashing
+    random_state=0,
+).fit(features(train), targets(train))
+print("Random Forest score:")
 print(score(rf.predict(features(test)), test))
 
-# MLP
 
+# 5. MLP on GB200 GPU
+def fit_mlp(train_df, val_df, epochs=5, batch=512, lr=1e-3):
+    X_tr_np = features(train_df)
+    y_tr_np = targets(train_df)
+    X_va_np = features(val_df)
+    y_va_np = targets(val_df)
 
-def fit_mlp(train, val, epochs=30, batch=512):
-    scaler = StandardScaler().fit(features(train))
-    y_mean, y_std = targets(train).mean(0), targets(train).std(0)
-    to_X = lambda f: torch.tensor(scaler.transform(features(f)), dtype=torch.float32)
-    to_y = lambda f: torch.tensor((targets(f) - y_mean) / y_std, dtype=torch.float32)
-    X, y, Xv, yv = to_X(train), to_y(train), to_X(val), to_y(val)
+    scaler = StandardScaler().fit(X_tr_np)
+    y_mean = torch.tensor(y_tr_np.mean(0), dtype=torch.float32, device=device)
+    y_std = torch.tensor(y_tr_np.std(0), dtype=torch.float32, device=device)
+
+    # Pre-load full feature tensors directly onto GPU VRAM
+    X = torch.tensor(scaler.transform(X_tr_np), dtype=torch.float32, device=device)
+    y = (torch.tensor(y_tr_np, dtype=torch.float32, device=device) - y_mean) / y_std
+    Xv = torch.tensor(scaler.transform(X_va_np), dtype=torch.float32, device=device)
+    yv = (torch.tensor(y_va_np, dtype=torch.float32, device=device) - y_mean) / y_std
 
     net = nn.Sequential(
         nn.Linear(X.shape[1], 64),
         nn.ReLU(),
         nn.Linear(64, 256),
         nn.ReLU(),
-        nn.Linear(256, 1024),
-        nn.ReLU(),
-        # nn.Linear(1024, 4096),
-        # nn.ReLU(),
-        # nn.Linear(4096, 4096),
-        # nn.ReLU(),
-        # nn.Linear(4096, 4096),
-        # nn.ReLU(),
-        # nn.Linear(4096, 4096),
-        # nn.ReLU(),
-        # nn.Linear(4096, 4096),
-        # nn.ReLU(),
-        # nn.Linear(4096, 1024),
-        # nn.ReLU(),
-        nn.Linear(1024, 256),
-        nn.ReLU(),
         nn.Linear(256, 64),
         nn.ReLU(),
         nn.Linear(64, len(TARGETS)),
-    )
-    opt = torch.optim.Adam(net.parameters(), lr=1e-3)
+    ).to(device)
+
+    opt = torch.optim.Adam(net.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
 
     val_loss = []
+    n_samples = len(X)
+
     for epoch in range(epochs):
-        perm = torch.randperm(len(X))
-        for i in range(0, len(X), batch):
+        net.train()
+        perm = torch.randperm(n_samples, device=device)
+        for i in range(0, n_samples, batch):
             idx = perm[i : i + batch]
             opt.zero_grad()
-            loss_fn(net(X[idx]), y[idx]).backward()
+            loss = loss_fn(net(X[idx]), y[idx])
+            loss.backward()
             opt.step()
+
+        net.eval()
         with torch.no_grad():
             val_loss.append(loss_fn(net(Xv), yv).item())
 
     def predict(frame):
+        net.eval()
         with torch.no_grad():
-            return net(to_X(frame)).numpy() * y_std + y_mean
+            X_eval = torch.tensor(
+                scaler.transform(features(frame)),
+                dtype=torch.float32,
+                device=device,
+            )
+            return (net(X_eval) * y_std + y_mean).cpu().numpy()
 
     return predict, val_loss
 
 
 torch.manual_seed(0)
 mlp, val_loss = fit_mlp(train, test)
-print("val loss", [round(v, 4) for v in val_loss[4::5]])
+print("MLP val loss (end of run):", round(val_loss[-1], 4))
 print(score(mlp(test), test))
 
-# Cross validation
-
+# 6. Cross validation (5-fold)
 rows, curves = [], []
-for k, (tr, va) in enumerate(KFold(5, shuffle=True, random_state=0).split(ids)):
-    tr, va = rows_of(ids[tr]), rows_of(ids[va])
+kf = KFold(5, shuffle=True, random_state=0)
+
+for k, (tr_idx, va_idx) in enumerate(kf.split(data)):
+    # O(1) row slicing using iloc instead of isin()
+    tr, va = data.iloc[tr_idx], data.iloc[va_idx]
+
     lin_k = make_pipeline(StandardScaler(), LinearRegression()).fit(
         features(tr), targets(tr)
     )
-    rf_k = RandomForestRegressor(n_estimators=100, n_jobs=-1, random_state=0).fit(
+    rf_k = RandomForestRegressor(n_estimators=100, n_jobs=16, random_state=0).fit(
         features(tr), targets(tr)
     )
+
     torch.manual_seed(k)
     mlp_k, val_loss = fit_mlp(tr, va)
     curves.append(val_loss)
@@ -180,24 +185,18 @@ for k, (tr, va) in enumerate(KFold(5, shuffle=True, random_state=0).split(ids)):
 cv = pd.DataFrame(rows)
 cv.loc["mean"] = cv.mean()
 cv.loc["std"] = cv.iloc[:-1].std()
+print("\nCV Summary:")
 print(cv.round(4))
 
-# for k, c in enumerate(curves):
-#     plt.plot(c, label=f"fold {k}")
-# plt.yscale("log")
-# plt.xlabel("epoch")
-# plt.ylabel("val loss (MSE, standardised)")
-# plt.legend()
-# plt.show()
 
-# Submission
-
+# 7. Submission file generation
 submission = pd.DataFrame(physical(mlp(test_inputs)), columns=TARGETS)
 submission.insert(0, "z_mm", test_inputs.z_mm.to_numpy())
 submission.insert(0, "config", test_inputs.config.to_numpy())
 submission.to_csv("submission_trajectory.csv", index=False)
-print(f"wrote submission_trajectory.csv ({len(submission):,} rows)")
+print(f"\nWrote submission_trajectory.csv ({len(submission):,} rows)")
 
+# 8. Benchmark comparison table
 EMULATOR = {
     "E_MeV": 0.9633,
     "q_pC": 0.9331,
@@ -207,6 +206,7 @@ EMULATOR = {
     "sigz_um": 0.8623,
     "mean": 0.8960,
 }
+
 print(
     pd.DataFrame(
         {
