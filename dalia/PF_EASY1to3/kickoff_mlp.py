@@ -349,6 +349,10 @@ from sklearn.preprocessing import StandardScaler
 MLP_HIDDEN = (1024, 512, 256)
 MLP_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+print(torch.__version__)
+print("CUDA dispo :", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("GPU :", torch.cuda.get_device_name(0))
 
 class _MLP(nn.Module):
     def __init__(self, n_in, n_out, hidden):
