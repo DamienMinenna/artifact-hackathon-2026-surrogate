@@ -1,4 +1,4 @@
-cd /workspace/Laser_Focused/dalia/VAE_torch
+cd /workspace/Laser_Focused/test_EASY_inverted
 
-python VAE_torch.py
+python script_test_invertedA.py
 

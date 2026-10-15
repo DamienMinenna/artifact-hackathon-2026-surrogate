@@ -48,10 +48,8 @@ def normalize_dataset(df: pd.DataFrame):
     return norm_df, df_mean, df_std
 
 
-PATH_DATA = "/workspace/data/surrogate-models/data"
-
 # Load and cure data
-PACK = "/workspace/data/surrogate-models/data/sample"
+PACK = "/workspace/data/surrogate-models/data/pallas_hackathon_data"
 data = cure_dataset(pd.read_parquet(f"{PACK}/campaign_B_moments.parquet"))
 norm_data, data_mean, data_std = normalize_dataset(data)
 
