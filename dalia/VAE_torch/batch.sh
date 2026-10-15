@@ -4,10 +4,10 @@
 #SBATCH --output=slurm_logs/%x_%j.out
 #SBATCH --error=slurm_logs/%x_%j.err
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=4
+#SBATCH --gpus-per-node=1
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=36
-#SBATCH --time=00:10:00
+#SBATCH --time=01:00:00
 
 set -x
 
