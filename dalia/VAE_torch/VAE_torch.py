@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
 from tqdm import tqdm
@@ -33,21 +32,10 @@ def normalize_dataset(df: pd.DataFrame):
 
     return norm_df, df_mean, df_std
 
-def transform_dataset(df: pd.DataFrame):
-    k1 = 0.02
-    k2 = 0.1
-    df["t_mean_y"] = np.tanh(df["mean_y"]) + k1 * df["mean_y"]
-    df["t_mean_z"] = np.tanh(df["mean_z"]) + k1 * df["mean_z"]
-    df["t_mean_uy"] = np.tanh(df["mean_uy"]) + k2 * df["mean_uy"]
-    df["t_mean_uz"] = np.tanh(df["mean_uz"]) + k2 * df["mean_uz"]
-
-    return df
-
 # Load and cure data
 PACK = "data/sample"
 data = cure_dataset(pd.read_parquet(f"{PACK}/campaign_B_moments.parquet"))
 norm_data, data_mean, data_std = normalize_dataset(data)
-# norm_data = transform_dataset(norm_data)
 
 # Find GPU devices to train on if any else cpu
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -67,8 +55,6 @@ torch_targets = torch.tensor(norm_data[TARGETS].to_numpy(), device=device, dtype
 
 # Split train / test
 X_train, X_test, Y_train, Y_test = train_test_split(torch_features, torch_targets, test_size=0.15, random_state=0)
-# Create Dataloader for the training loop
-loader = DataLoader(TensorDataset(X_train, Y_train), batch_size=512, shuffle=True, pin_memory=True)
 
 
 # Create VAE model
@@ -109,9 +95,11 @@ def loss_fn(y_pred, y_true, mu, logvar):
 # Setup Hyperparameters
 EPOCHS = 5_000
 LR = 1e-3
+DATA_SIZE = X_train.shape[0]
+BATCH_SIZE = 1024
 
 # Setup VAE
-model = VAE(n_in=len(FEATURES), n_out=len(TARGETS), latent=2).to(device)
+model = VAE(n_in=len(FEATURES), n_out=len(TARGETS), hidden=(512, 128, 32), latent=2).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
@@ -122,10 +110,13 @@ loss_arr = {"train": [], "test": []}
 
 for epoch in pbar:
     tot, n = 0., 0
-
+    # Shuffle dataset
+    random_idx = torch.randperm(DATA_SIZE, device=device)
     model.train()
     # Training loop
-    for x, y in loader:
+    for start in range(0, DATA_SIZE, BATCH_SIZE): # manually indexing batch size
+        idx = random_idx[start : start + BATCH_SIZE]
+        x, y = X_train[idx], Y_train[idx]
         optimizer.zero_grad()
         y_pred, mu, logvar = model(x)
         loss, recon, kl = loss_fn(y_pred, y, mu, logvar)
@@ -141,16 +132,16 @@ for epoch in pbar:
             pred = model.dec(model.mu(model.enc(X_test)))
             per_target = torch.square(pred - Y_test).mean(0)
 
-    # Print info
-    mse = ((model.predict(X_test) - Y_test) ** 2).mean(0)
-    pbar.set_postfix(train=f"{tot / n / len(TARGETS):.4f}", test=f"{mse.mean():.3f}")
-    loss_arr["train"].append(tot / n / len(TARGETS))
-    loss_arr["test"].append(mse.mean())
+        # Print info
+        mse = ((model.predict(X_test) - Y_test) ** 2).mean(0)
+        pbar.set_postfix(train=f"{tot / n / len(TARGETS):.4f}", test=f"{mse.mean():.3f}")
+        loss_arr["train"].append(tot / n / len(TARGETS))
+        loss_arr["test"].append(mse.mean())
 
     sched.step()
 
 # Plot training loss
-x = np.arange(EPOCHS)
+x = np.arange(len(loss_arr["test"]))
 fig, ax = plt.subplots()
 ax.semilogy(x,loss_arr["train"], label="Train loss")
 ax.semilogy(x,loss_arr["test"], label="Test loss")
@@ -174,20 +165,27 @@ for col, s in zip(TARGETS, r2):
     print(f"{col:12s} R² = {s:.3f}")
 print(f"{'mean':12s} R² = {r2.mean():.3f}")
 
+
+test_pred = model.predict(X_test)
+submission = pd.DataFrame(test_pred, columns=TARGETS)
+submission.to_csv("submission_campaign_B_moments.csv", index=False)
+print(f"submission_campaign_B_moments.csv  ({len(submission):,} rows)")
+submission.head()
+
 # Best so far
 """
-mean_zeta    R² = 0.903
-t_mean_y     R² = 0.577
-t_mean_z     R² = 0.417
-mean_ux      R² = 0.928
-t_mean_uy    R² = 0.671
-t_mean_uz    R² = 0.518
-sigma_zeta   R² = 0.893
-sigma_y      R² = 0.958
-sigma_z      R² = 0.957
-sigma_ux     R² = 0.932
+mean_zeta    R² = 0.836
+mean_y       R² = 0.811
+mean_z       R² = 0.744
+mean_ux      R² = 0.916
+mean_uy      R² = 0.754
+mean_uz      R² = 0.775
+sigma_zeta   R² = 0.880
+sigma_y      R² = 0.959
+sigma_z      R² = 0.955
+sigma_ux     R² = 0.928
 sigma_uy     R² = 0.950
-sigma_uz     R² = 0.947
-q_tot_pC     R² = 0.957
-mean         R² = 0.816
+sigma_uz     R² = 0.949
+q_tot_pC     R² = 0.961
+mean         R² = 0.878
 """
