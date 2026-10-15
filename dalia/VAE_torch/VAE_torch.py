@@ -8,22 +8,9 @@ from sklearn.metrics import r2_score
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-
 def cure_dataset(df: pd.DataFrame):
-    rename_data = df[
-        [
-            "P_max",
-            "cN2_max",
-            "L_inj",
-            "dip_frac",
-            "x_of",
-            "plane_mm",
-            "mean_ux",
-            "mean_uy",
-            "mean_uz",
-            "q_tot_pC",
-        ]
-    ].copy()
+    rename_data = df[["P_max", "cN2_max", "L_inj", "dip_frac", "x_of", "plane_mm",
+                        "mean_ux", "mean_uy", "mean_uz", "q_tot_pC"]].copy()
 
     rename_data["mean_zeta"] = df["mean_zeta_um"]
     rename_data["mean_y"] = df["mean_y_um"]
@@ -39,7 +26,6 @@ def cure_dataset(df: pd.DataFrame):
 
     return rename_data
 
-
 def normalize_dataset(df: pd.DataFrame):
     df_mean = df.mean()
     df_std = df.std()
@@ -47,11 +33,21 @@ def normalize_dataset(df: pd.DataFrame):
 
     return norm_df, df_mean, df_std
 
+def transform_dataset(df: pd.DataFrame):
+    k1 = 0.02
+    k2 = 0.1
+    df["t_mean_y"] = np.tanh(df["mean_y"]) + k1 * df["mean_y"]
+    df["t_mean_z"] = np.tanh(df["mean_z"]) + k1 * df["mean_z"]
+    df["t_mean_uy"] = np.tanh(df["mean_uy"]) + k2 * df["mean_uy"]
+    df["t_mean_uz"] = np.tanh(df["mean_uz"]) + k2 * df["mean_uz"]
+
+    return df
 
 # Load and cure data
-PACK = "/workspace/data/surrogate-models/data/pallas_hackathon_data"
+PACK = "data/sample"
 data = cure_dataset(pd.read_parquet(f"{PACK}/campaign_B_moments.parquet"))
 norm_data, data_mean, data_std = normalize_dataset(data)
+# norm_data = transform_dataset(norm_data)
 
 # Find GPU devices to train on if any else cpu
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -59,36 +55,20 @@ print(f"Set device to {device}")
 
 # Split data between FEATURES and TARGETS
 FEATURES = ["P_max", "cN2_max", "L_inj", "dip_frac", "x_of", "plane_mm"]
-TARGETS = [
-    "mean_zeta",
-    "mean_y",
-    "mean_z",
-    "mean_ux",
-    "mean_uy",
-    "mean_uz",
-    "sigma_zeta",
-    "sigma_y",
-    "sigma_z",
-    "sigma_ux",
-    "sigma_uy",
-    "sigma_uz",
-    "q_tot_pC",
-]
+TARGETS = ["mean_zeta", "mean_y", "mean_z",
+           "mean_ux", "mean_uy", "mean_uz",
+           "sigma_zeta", "sigma_y", "sigma_z",
+           "sigma_ux", "sigma_uy", "sigma_uz",
+           "q_tot_pC"]
 
 # Convert dataframe to tensor
-torch_features = torch.tensor(
-    norm_data[FEATURES].to_numpy(), device=device, dtype=torch.float32
-)
-torch_targets = torch.tensor(
-    norm_data[TARGETS].to_numpy(), device=device, dtype=torch.float32
-)
+torch_features = torch.tensor(norm_data[FEATURES].to_numpy(), device=device, dtype=torch.float32)
+torch_targets = torch.tensor(norm_data[TARGETS].to_numpy(), device=device, dtype=torch.float32)
 
 # Split train / test
-X_train, X_test, Y_train, Y_test = train_test_split(
-    torch_features, torch_targets, test_size=0.15, random_state=0
-)
+X_train, X_test, Y_train, Y_test = train_test_split(torch_features, torch_targets, test_size=0.15, random_state=0)
 # Create Dataloader for the training loop
-loader = DataLoader(TensorDataset(X_train, Y_train), batch_size=256, shuffle=True)
+loader = DataLoader(TensorDataset(X_train, Y_train), batch_size=512, shuffle=True, pin_memory=True)
 
 
 # Create VAE model
@@ -99,7 +79,6 @@ def mlp(sizes):
     layers.append(nn.Linear(sizes[-2], sizes[-1]))
     return nn.Sequential(*layers)
 
-
 class VAE(nn.Module):
     def __init__(self, n_in, n_out, hidden=(256, 64, 16), latent=2):
         super(VAE, self).__init__()
@@ -109,34 +88,32 @@ class VAE(nn.Module):
         self.logvar = nn.Linear(hidden[-1], latent)
         self.dec = mlp([latent, *hidden[::-1], n_out])
 
+
     def forward(self, x):
         e = self.enc(x)
         mu, logvar = self.mu(e), self.logvar(e)
-        z = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
+        z = mu + torch.randn_like(mu) * torch.exp(0.5*logvar)
         return self.dec(z), mu, logvar
 
     @torch.no_grad()
     def predict(self, X):
         return model.dec(model.mu(model.enc(X)))
 
-
 # Setup VAE loss function with KL loss
 def loss_fn(y_pred, y_true, mu, logvar):
     c_loss = torch.square(y_pred - y_true).sum(-1).mean()
-    kl_loss = (
-        -0.5 * (1 + logvar - torch.square(mu) - torch.exp(logvar)).sum(-1)
-    ).mean()
+    kl_loss = (-0.5 * (1 + logvar - torch.square(mu) - torch.exp(logvar)).sum(-1)).mean()
 
-    return c_loss + 1e-3 * kl_loss, c_loss, kl_loss
-
+    return c_loss + 1e-3*kl_loss, c_loss, kl_loss
 
 # Setup Hyperparameters
-EPOCHS = 1_000
+EPOCHS = 5_000
 LR = 1e-3
 
 # Setup VAE
 model = VAE(n_in=len(FEATURES), n_out=len(TARGETS), latent=2).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
 # Start training VAE
 print("Start training VAE")
@@ -144,7 +121,7 @@ pbar = tqdm(range(EPOCHS), desc="VAE")
 loss_arr = {"train": [], "test": []}
 
 for epoch in pbar:
-    tot, n = 0.0, 0
+    tot, n = 0., 0
 
     model.train()
     # Training loop
@@ -158,7 +135,7 @@ for epoch in pbar:
         n += len(x)
 
     # Eval loop
-    if epoch % 5 == 0:
+    if epoch%5==0:
         model.eval()
         with torch.no_grad():
             pred = model.dec(model.mu(model.enc(X_test)))
@@ -170,11 +147,13 @@ for epoch in pbar:
     loss_arr["train"].append(tot / n / len(TARGETS))
     loss_arr["test"].append(mse.mean())
 
+    sched.step()
+
 # Plot training loss
 x = np.arange(EPOCHS)
 fig, ax = plt.subplots()
-ax.semilogy(x, loss_arr["train"], label="Train loss")
-ax.semilogy(x, loss_arr["test"], label="Test loss")
+ax.semilogy(x,loss_arr["train"], label="Train loss")
+ax.semilogy(x,loss_arr["test"], label="Test loss")
 ax.legend()
 ax.grid(alpha=0.3)
 ax.set_xlabel("Training steps")
@@ -194,3 +173,21 @@ r2 = r2_score(y_true, y_pred, multioutput="raw_values")
 for col, s in zip(TARGETS, r2):
     print(f"{col:12s} R² = {s:.3f}")
 print(f"{'mean':12s} R² = {r2.mean():.3f}")
+
+# Best so far
+"""
+mean_zeta    R² = 0.903
+t_mean_y     R² = 0.577
+t_mean_z     R² = 0.417
+mean_ux      R² = 0.928
+t_mean_uy    R² = 0.671
+t_mean_uz    R² = 0.518
+sigma_zeta   R² = 0.893
+sigma_y      R² = 0.958
+sigma_z      R² = 0.957
+sigma_ux     R² = 0.932
+sigma_uy     R² = 0.950
+sigma_uz     R² = 0.947
+q_tot_pC     R² = 0.957
+mean         R² = 0.816
+"""
